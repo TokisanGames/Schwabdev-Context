@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "schwabdev_trader"
+version = "0.0.1"
+description = "A unified environment for deployment and backtesting for Schwabdev."
+readme = { file = "README.md", content-type = "text/markdown" }
+authors = [{name = "Tyler Bowers"}, {email = "tylerebowers@gmail.com"}]
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "schwabdev"
+]
+keywords = [
+    "python", 
+    "schwab", 
+    "api", 
+    "client", 
+    "finance", 
+    "trading", 
+    "stocks", 
+    "equities", 
+    "backtesting",
+    "quant"
+]
+classifiers=[
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+]
+
+[project.urls]
+Homepage = "https://github.com/tylerebowers/Schwabdev"
+Documentation = "https://tylerebowers.github.io/Schwabdev/"
+Source = "https://github.com/tylerebowers/Schwabdev-Trader"
+Youtube = "https://www.youtube.com/playlist?list=PLs4JLWxBQIxpbvCj__DjAc0RRTlBz-TR8"
+PyPI = "https://pypi.org/project/schwabdev-trader/"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = "tests/"
+
+[dependency-groups]
+test = [
+    'pytest',
+]
+
+
+[tool.coverage.run]
+omit = [
+    "*/tests/*"
+]
