@@ -6,12 +6,11 @@ from .data import Data
 
 
 class Trader:
-    def __init__(self, client: object = None, account_hash: str = None, live_orders: bool = False, cache_db: str = "~/.schwabdev/candles.db"):
-        if live_orders and not (account_hash and client):
+    def __init__(self, client: object = None, account_hash: str = None, cache_db: str = "~/.schwabdev/candles.db"):
+        if account_hash and not client:
             raise ValueError("client and account_hash are required for live trading (hint: client.linked_accounts().json())")
         self._client = client
         self._account_hash = account_hash
-        self._live_orders = live_orders
         self.data = Data(cache_db, client)
         self._streamer = None
         self.live = None
@@ -57,8 +56,7 @@ class Trader:
 
     # live trading ------------------------------------------------------------
 
-    def deploy(self, strategy, tickers, cash=0, plot=True, chart=True, level1=False, level2=False, 
-               record=True, costs=None, sync_positions=True):
+    def deploy(self, strategy, tickers, cash=0, plot=True, chart=True, level1=False, level2=False, record=True, costs=None, sync_positions=True):
         """Open a live session and stream market data + account activity into it. Orders are sent
         to the broker only when this Trader was created with live_orders=True; otherwise the
         session paper-trades on live data. Returns the LiveContext (also available as `self.live`).
@@ -73,8 +71,9 @@ class Trader:
         positions. With record=True (default) every subscribed data type is also written to the DB
         through the same `Data.parse`/`Data.write` pair `record()` uses — so a live session backfills
         the candle cache AND captures l1/l2 history for later backtests, for free."""
-        account_hash = self._account_hash if self._live_orders else None 
-        session = LiveContext(tickers, cash, self._client, account_hash, costs=costs)
+        if self._account_hash:
+            input("LIVE ORDERS ENABLED, orders will be sent to Schwab. Press ENTER to continue or Ctrl-C to abort.")
+        session = LiveContext(tickers, cash, self._client, self._account_hash, costs=costs)
         self.live = session
         if session.live_orders:
             session.sync_account(positions=sync_positions)

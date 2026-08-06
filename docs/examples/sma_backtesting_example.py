@@ -43,6 +43,6 @@ class sma_Strategy:
                     tc.order(order(sym, "SELL", qty))
 
 
-t = Trader(client, cache_db="~/.schwabdev/candles.db")
+t = Trader(client)
 strat = sma_Strategy(tickers=tickers)
 run = t.backtest(strat, tickers=tickers, cash=10_000, history_days=60, plot=True)

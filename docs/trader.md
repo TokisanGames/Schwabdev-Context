@@ -83,3 +83,21 @@ through the one `_fill` method, so cash / positions stay consistent everywhere.
 Thread safety: a live session is mutated from the stream thread while the viewer's HTTP thread
 reads it. Ledger mutations take `self._lock`, and readers should use `snapshot_orders()` rather
 than walking `orders` directly.
+
+## Data
+
+"""Data: the single gateway to the candle store — the ONLY class that touches the DB.
+
+Backtests read cached minute candles (and any recorded level-1 / level-2 events) from it; live
+recording writes candles / quotes / order-book snapshots into it. One SQLite table per ticker and
+data type:
+
+    chart_{ticker} : minute candles      (time PRIMARY KEY, open, high, low, close, volume)
+    l1_{ticker}    : level-one quotes    (time, bid, ask, last, bid_size, ask_size)
+    l2_{ticker}    : order-book snapshots (time, bids TEXT(json), asks TEXT(json))
+
+For candles, only the missing date ranges are fetched from Schwab (minute candles cap at
+10 days/request, so gaps are pulled in 10-day chunks). Schwab has NO history API for l1/l2 — those
+tables can only be populated live, via `record()` or a `Trader.deploy()` session (which records
+whatever it subscribes to through the same `parse`/`write` pair). With no client the store runs
+read-only, replaying purely from disk."""
