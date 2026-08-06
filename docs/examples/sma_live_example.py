@@ -1,4 +1,4 @@
-from schwabdev import Client, Trader
+from schwabdev import Context, Client
 
 client = Client()
 tickers = ["AMD", "INTC"]
@@ -42,6 +42,6 @@ class sma_Strategy:
                     tc.order(order(sym, "SELL", qty))
 
 
-t = Trader(client)
+tc = Context(client)
 strat = sma_Strategy(tickers=tickers)
-run = t.deploy(strat, tickers=tickers, cash=10_000, plot=True)
+run = tc.deploy(strat, tickers=tickers, cash=10_000, plot=True)

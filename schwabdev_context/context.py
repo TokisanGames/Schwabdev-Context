@@ -1,16 +1,20 @@
 import time
 import schwabdev
 from itertools import groupby
-from .context import BacktestContext, LiveContext
+from .base import BacktestContext, LiveContext
 from .data import Data
 
 
-class Trader:
-    def __init__(self, client: object = None, account_hash: str = None, cache_db: str = "~/.schwabdev/candles.db"):
+class Context:
+    def __init__(self, client: object = None, account_hash: str = None, cache_db: str = "~/.schwabdev/candles.db", safety: bool = True):
+        """`safety` (default on) makes the live session refuse orders priced dangerously far from
+        the market — a BUY more than 5% above, or a SELL more than 5% below, the minimum of the
+        most recent OHLC candle. It guards live/paper sessions only; backtests are unaffected."""
         if account_hash and not client:
             raise ValueError("client and account_hash are required for live trading (hint: client.linked_accounts().json())")
         self._client = client
         self._account_hash = account_hash
+        self._safety = safety
         self.data = Data(cache_db, client)
         self._streamer = None
         self.live = None
@@ -29,7 +33,8 @@ class Trader:
 
         `costs` (a `Costs` instance) sets the spread/slippage/fee model and `fill_delay` how many
         candles a MARKET order waits before filling at that candle's open."""
-        run = BacktestContext(tickers, cash, costs=costs, fill_delay=fill_delay)
+        if costs is None: costs = Costs() # default values
+        run = BacktestContext(tickers, cash, costs, fill_delay=fill_delay)
 
         if plot:
             run.serve(port=8000)
@@ -73,7 +78,7 @@ class Trader:
         the candle cache AND captures l1/l2 history for later backtests, for free."""
         if self._account_hash:
             input("LIVE ORDERS ENABLED, orders will be sent to Schwab. Press ENTER to continue or Ctrl-C to abort.")
-        session = LiveContext(tickers, cash, self._client, self._account_hash, costs=costs)
+        session = LiveContext(tickers, cash, self._client, self._account_hash, costs=costs, safety=self._safety)
         self.live = session
         if session.live_orders:
             session.sync_account(positions=sync_positions)
@@ -122,3 +127,37 @@ class Trader:
             server.server_close()
             self.live._server = None
         self.data.close()
+
+
+class Costs:
+    """Transaction-cost model applied at fill time (simulation only). `apply` returns the
+    effective execution price (reference price moved against you by half-spread + slippage) and
+    the cash fee (flat + per-share + percentage, plus sell-only SEC/FINRA regulatory fees).
+
+    `worst` caps the price for orders that legally cannot fill through their own level: a BUY LIMIT
+    never pays more than the limit, a SELL LIMIT never receives less. Slippage on a limit order
+    shows up as a missed fill in reality, not a worse price."""
+
+    def __init__(self, flat=0.0, per_share=0.0, pct=0.00_05, half_spread=0.0, slip=0.0, sec_fee=20.60e-6, taf_per_share=0.000195):
+        self.flat, self.per_share, self.pct = flat, per_share, pct
+        self.half_spread, self.slip = half_spread, slip
+        self.sec_fee, self.taf = sec_fee, taf_per_share
+
+    def apply(self, instruction, qty, ref_price, limit=None):
+        side = 1 if instruction == "BUY" else -1
+        exec_price = ref_price * (1 + side * (self.half_spread + self.slip))
+        if limit is not None: # can't fill through your own limit
+            exec_price = min(exec_price, limit) if side > 0 else max(exec_price, limit)
+        exec_price = max(exec_price, 0.0)
+        fee = self.flat + self.per_share * qty + self.pct * qty * exec_price
+        if instruction == "SELL": # regulatory: sells only
+            fee += self.sec_fee * qty * exec_price + self.taf * qty
+        return exec_price, fee
+
+class Costs_Zero(Costs):
+    """A Costs instance that does nothing, for testing."""
+    def __init__(self):
+        super().__init__(flat=0.0, per_share=0.0, pct=0.0, half_spread=0.0, slip=0.0, sec_fee=0.0, taf_per_share=0.0)
+
+    def apply(self, instruction, qty, ref_price, limit=None):
+        return ref_price, 0

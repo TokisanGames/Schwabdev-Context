@@ -1,4 +1,4 @@
-from schwabdev import Client, Trader
+from schwabdev import Context, Client
 
 client = Client() # or client = Client(...); not needed when candles are cached
 tickers = ["MSFT", "NVDA", "AAPL", "GOOGL", "META", "AMZN", "TSLA", "MSTR",
@@ -43,6 +43,6 @@ class sma_Strategy:
                     tc.order(order(sym, "SELL", qty))
 
 
-t = Trader(client)
+tc = Context(client)
 strat = sma_Strategy(tickers=tickers)
-run = t.backtest(strat, tickers=tickers, cash=10_000, history_days=60, plot=True)
+run = tc.backtest(strat, tickers=tickers, cash=10_000, history_days=60, plot=True)

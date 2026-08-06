@@ -1,6 +1,6 @@
 # This example shows how to send live orders to the broker.
 
-from schwabdev import Client, Trader
+from schwabdev import Context, Client
 
 client = Client()
 hash = client.linked_accounts().json()[0]["hashValue"]
@@ -21,7 +21,7 @@ class sma_Strategy:
 
     def __call__(self, tc, events):
         for e in events:
-            if e["type"] != "c":            # act on candles only
+            if e["type"] != "c": # act on candles only
                 continue
             sym = e["symbol"]
             closes = [c["close"] for c in tc.candles[sym]]
@@ -36,14 +36,13 @@ class sma_Strategy:
 
             price = closes[-1]
             if fast_prev <= slow_prev and fast_now > slow_now:      # crossed up -> buy a slice
-                if qty > 0:
-                    tc.order(order(sym, "BUY", 1))
+                tc.order(order(sym, "BUY", 1))
             elif fast_prev >= slow_prev and fast_now < slow_now:    # crossed down -> exit
                 qty = int(tc.sellable(sym))
                 if qty > 0:
                     tc.order(order(sym, "SELL", 1))
 
 
-t = Trader(client, account_hash=hash)
+tc = Context(client, account_hash=hash)
 strat = sma_Strategy(tickers=tickers)
-run = t.deploy(strat, tickers=tickers, cash=1_000, plot=True)
+run = tc.deploy(strat, tickers=tickers, cash=1_000, plot=True)

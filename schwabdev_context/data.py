@@ -15,7 +15,7 @@ class Data:
         self.db_path = os.path.expanduser(cache_db)
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         self._client = client
-        self._con = sqlite3.connect(self.db_path)
+        self._con = sqlite3.connect(self.db_path, check_same_thread=False)
         self._tables = set() 
 
     @staticmethod
@@ -57,26 +57,7 @@ class Data:
             if earliest > ms(need_start):
                 ranges.append((need_start, to_dt(earliest))) # backfill older history
 
-        def _fetch_candles(self, ticker, start, end):
-            """One price-history request"""
-            try:
-                r = self._client.price_history(ticker, periodType="day", frequencyType="minute",
-                                            frequency=1, startDate=start, endDate=end,
-                                            needExtendedHoursData=False)
-            except Exception as exc:
-                print(f"[data] {ticker} price_history failed: {exc}")
-                return []
-            if not r.ok:
-                print(f"[data] {ticker} price_history {r.status_code} for "
-                    f"{start:%Y-%m-%d}..{end:%Y-%m-%d}")
-                return []
-            try:
-                return r.json().get("candles", []) or []
-            except ValueError:
-                return []
-
-        # fetch each missing range in <=10-day chunks and cache it (INSERT OR IGNORE dedupes).
-        # with no client we run cache-only and skip all API calls.
+        # fetch each missing range in <=10-day chunks and cache it (INSERT OR IGNORE dedupes) with no client we run cache-only and skip all API calls.
         for start, end in (ranges if self._client else []):
             cur = end
             while cur > start:
@@ -97,6 +78,24 @@ class Data:
         return [{"symbol": ticker, "time": t, "open": o, "high": h, "low": l, "close": c,
                  "volume": v, "type": "c"} for t, o, h, l, c, v in rows]
 
+
+    def _fetch_candles(self, ticker, start, end):
+        """One price-history request, returning the raw candle list (empty on any failure)."""
+        try:
+            r = self._client.price_history(ticker, periodType="day", frequencyType="minute",
+                                           frequency=1, startDate=start, endDate=end,
+                                           needExtendedHoursData=False)
+        except Exception as exc:
+            print(f"[data] {ticker} price_history failed: {exc}")
+            return []
+        if not r.ok:
+            print(f"[data] {ticker} price_history {r.status_code} for "
+                  f"{start:%Y-%m-%d}..{end:%Y-%m-%d}")
+            return []
+        try:
+            return r.json().get("candles", []) or []
+        except ValueError:
+            return []
 
     def get_events(self, ticker, history_days, level1=False, level2=False):
         """Chronological RECORDED level-1 quotes / level-2 book snapshots for `ticker` over the

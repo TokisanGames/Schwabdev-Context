@@ -1,16 +1,34 @@
-"""Exercise the module: backtest fills, FIFO stats, paper vs live order paths, activity parsing."""
+"""Self-contained test suite for schwabdev_context — no network, no Schwab client, runs in ~1s.
+
+Run:  python test_context.py        (exits non-zero if anything fails)
+
+Covers: the Costs models, candle ingest, simulated MARKET/LIMIT/STOP fills, cash reservations,
+the live safety guard, the live order/cancel/account-activity paths, Data parse/read/write,
+FIFO trade matching and stats, the viewer payload, and ledger thread safety.
+
+Two checks in the "KNOWN BUGS" section FAIL against the current module — they are not broken
+tests, they pin real defects and should start passing once those are fixed. See that section for
+the one-line fixes.
+"""
 import json, math, os, sys, tempfile, datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from trader.context import BacktestContext, LiveContext, Costs, dec
-from trader.data import Data
-from trader.trader import Trader, _wakes
-from trader import analysis
+from schwabdev_context.base import BacktestContext, LiveContext, dec
+from schwabdev_context.data import Data
+from schwabdev_context.context import Context, Costs, Costs_Zero
+from schwabdev_context import analysis
 
 FAILS = []
 def check(name, cond, extra=""):
     print(("  PASS  " if cond else "  FAIL  ") + name + (f"   {extra}" if extra and not cond else ""))
     if not cond: FAILS.append(name)
+
+def _raises(fn, exc):
+    try:
+        fn(); return False
+    except exc:
+        return True
+
 
 def mkorder(sym, side, qty, otype="MARKET", price=None, stop=None):
     o = {"orderType": otype, "session": "NORMAL", "duration": "DAY",
@@ -36,17 +54,8 @@ check("empty node -> 0", dec({"signScale": 12}) == 0.0)
 check("plain number passes through", dec(3.5) == 3.5)
 check("garbage -> 0", dec("nope") == 0.0 and dec(None) == 0.0)
 
-print("\n== _wakes() ==========================================")
-book = {"symbol": "X", "time": 1, "bids": [], "asks": [], "type": "l2"}
-candle = {"symbol": "X", "time": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1, "type": "c"}
-quote = {"symbol": "X", "time": 1, "bid": 1, "ask": 2, "type": "l1"}
-check("disabled l2 does not wake", _wakes([book], chart=False, level1=True, level2=False) is False)
-check("enabled l1 wakes", _wakes([quote], chart=False, level1=True, level2=False) is True)
-check("candle alone does not wake with chart=False",
-      _wakes([candle], chart=False, level1=True, level2=False) is False)
-
 print("\n== candle ingest / duplicate forming bar ==============")
-ctx = BacktestContext(["AMD"], 10_000)
+ctx = BacktestContext(["AMD"], 10_000, Costs())
 ctx._ingest(candles("AMD", [100, 101]))
 ctx._ingest([{"symbol": "AMD", "time": 1_700_000_060_000, "open": 101, "high": 103,
              "low": 100, "close": 102.5, "volume": 5000.0, "type": "c"}])   # forming bar re-sent
@@ -58,7 +67,7 @@ print("\n== backtest MARKET fill delay =========================")
 def buy_once(tc, events):
     if not tc.orders and len(tc.candles["AMD"]) == 1:
         tc.order(mkorder("AMD", "BUY", 10))
-run = BacktestContext(["AMD"], 10_000, costs=Costs(pct=0, sec_fee=0, taf_per_share=0), fill_delay=2)
+run = BacktestContext(["AMD"], 10_000, Costs_Zero(), fill_delay=2)
 for c in candles("AMD", [100, 101, 102, 103]):
     run.step(buy_once, [c])
 rec = list(run.orders["AMD"].values())[0]
@@ -70,7 +79,7 @@ check("cash debited", abs(run._cash - (10_000 - 10*102.0)) < 1e-6, f"cash={run._
 check("position booked", run.positions["AMD"] == 10)
 
 print("\n== reservations =======================================")
-r2 = BacktestContext(["AMD"], 1000, fill_delay=99)
+r2 = BacktestContext(["AMD"], 1000, Costs(), fill_delay=99)
 r2._ingest(candles("AMD", [100]))
 r2.order(mkorder("AMD", "BUY", 5, "LIMIT", price=90))
 check("open buy reserves cash", abs(r2.cash - (1000 - 5*90)) < 1e-9, f"cash={r2.cash}")
@@ -79,7 +88,7 @@ r2.cancel(list(r2.orders["AMD"].values())[0]["id"])
 check("cancel frees the reservation", r2.cash == 1000)
 
 print("\n== LIMIT never fills through its own price ============")
-r3 = BacktestContext(["AMD"], 10_000, costs=Costs(slip=0.05, pct=0), fill_delay=2)
+r3 = BacktestContext(["AMD"], 10_000, Costs(slip=0.05, pct=0), fill_delay=2)
 r3._ingest(candles("AMD", [100]))
 r3.order(mkorder("AMD", "BUY", 1, "LIMIT", price=99))
 r3._ingest([{"symbol": "AMD", "time": 1_700_000_060_000, "open": 98, "high": 99,
@@ -91,7 +100,7 @@ check("buy limit fills at or better than the limit", lim["avg_price"] <= 99.0 + 
 check("buy limit actually filled", lim["status"] == "FILLED")
 
 print("\n== STOP triggers intrabar ============================")
-r4 = BacktestContext(["AMD"], 10_000, costs=Costs(pct=0, sec_fee=0, taf_per_share=0), fill_delay=2)
+r4 = BacktestContext(["AMD"], 10_000, Costs_Zero(), fill_delay=2)
 r4._ingest(candles("AMD", [100]))
 r4.positions["AMD"] = 10
 r4.order(mkorder("AMD", "SELL", 10, "STOP", stop=95))
@@ -132,7 +141,7 @@ check("sharpe finite", math.isfinite(cs["sharpe"]))
 check("short curve is safe", analysis._curve_stats([(0, 1)]) == {"max_drawdown": 0.0, "sharpe": 0.0})
 
 print("\n== paper LiveContext: limits must rest ===============")
-paper = LiveContext(["AMD"], 10_000, client=None, account_hash=None)
+paper = LiveContext(["AMD"], 10_000, costs=Costs())
 paper._ingest(candles("AMD", [100]))
 oid = paper.order(mkorder("AMD", "BUY", 1, "LIMIT", price=50))   # 50% below market
 prec = paper._find_order(oid)
@@ -143,6 +152,89 @@ check("paper market fills immediately", paper._find_order(oid2)["status"] == "FI
 paper.step(lambda tc, e: None, [{"symbol": "AMD", "time": 1_700_000_060_000, "open": 49,
                                  "high": 50, "low": 48, "close": 49, "volume": 1, "type": "c"}])
 check("paper limit fills once the market touches it", prec["status"] == "FILLED")
+
+print("\n== safety guard ======================================")
+# candle: open 100, high 101, low 99, close 100  -> ref = min(OHLC) = 99
+sg = LiveContext(["AMD"], 10_000, costs=Costs(), safety=True)
+sg._ingest(candles("AMD", [100]))
+def blocked(fn):
+    try: fn(); return False
+    except ValueError as e: return "safety" in str(e)
+check("BUY limit >5% above min(OHLC) blocked",
+      blocked(lambda: sg.order(mkorder("AMD", "BUY", 1, "LIMIT", price=104.0))))   # 99*1.05=103.95
+check("BUY limit just inside allowed",
+      sg.order(mkorder("AMD", "BUY", 1, "LIMIT", price=103.9)) is not None)
+check("SELL limit >5% below min(OHLC) blocked",
+      blocked(lambda: sg.order(mkorder("AMD", "SELL", 1, "LIMIT", price=94.0))))   # 99*0.95=94.05
+check("SELL limit just inside allowed",
+      sg.order(mkorder("AMD", "SELL", 1, "LIMIT", price=94.1)) is not None)
+check("SELL STOP far below blocked too (stop level is its price)",
+      blocked(lambda: sg.order(mkorder("AMD", "SELL", 1, "STOP", stop=90.0))))
+check("MARKET order passes (prices at last close)",
+      sg.order(mkorder("AMD", "BUY", 1)) is not None)
+check("blocked orders never reach the ledger",
+      not any(r["price"] in (104.0, 94.0, 90.0) for r in sg.snapshot_orders()))
+
+sg_off = LiveContext(["AMD"], 10_000, costs=Costs(), safety=False)
+sg_off._ingest(candles("AMD", [100]))
+check("safety=False disables the guard",
+      sg_off.order(mkorder("AMD", "BUY", 1, "LIMIT", price=150.0)) is not None)
+
+sg_new = LiveContext(["AMD"], 10_000, costs=Costs(), safety=True)  # no candles yet
+check("no candle yet -> nothing to compare, order allowed",
+      sg_new.order(mkorder("AMD", "BUY", 1, "LIMIT", price=1.0)) is not None)
+
+class SafeClient:
+    def __init__(self): self.calls = 0
+    def place_order(self, h, o):
+        self.calls += 1
+        return type("R", (), {"ok": True, "status_code": 201,
+                              "headers": {"location": "/orders/1"}, "text": ""})()
+sc = SafeClient()
+sg_live = LiveContext(["AMD"], 10_000, client=sc, account_hash="H", costs=Costs(), safety=True)
+sg_live._ingest(candles("AMD", [100]))
+check("live: unsafe order blocked BEFORE reaching the broker",
+      blocked(lambda: sg_live.order(mkorder("AMD", "BUY", 1, "LIMIT", price=104.0)))
+      and sc.calls == 0, f"broker calls={sc.calls}")
+check("Context passes safety through to the session",
+      Context(None, safety=False)._safety is False and Context(None)._safety is True)
+check("Context requires a client when an account hash is given",
+      _raises(lambda: Context(None, account_hash="H"), ValueError))
+
+print("\n== cost models =======================================")
+check("Costs_Zero charges nothing and moves no price",
+      Costs_Zero().apply("SELL", 10, 100.0) == (100.0, 0))
+px_d, fee_d = Costs().apply("SELL", 10, 100.0)
+check("default Costs charges regulatory fees on sells", fee_d > 0 and px_d == 100.0)
+px_b, fee_b = Costs().apply("BUY", 10, 100.0)
+check("default Costs charges no reg fees on buys", 0 < fee_b < fee_d)
+check("half_spread/slip move the price against the side",
+      Costs(half_spread=0.01).apply("BUY", 1, 100.0)[0] > 100.0
+      and Costs(half_spread=0.01).apply("SELL", 1, 100.0)[0] < 100.0)
+check("Costs is importable from the package root",
+      __import__("schwabdev_context", fromlist=["Costs"]).Costs is Costs)
+
+print("\n== KNOWN BUGS (expected to fail on this version) =====")
+# 1. deploy() defaults costs=None and passes it straight through; _Base stores it raw, so the
+#    first PAPER fill calls None.apply(...). Fix: `self.costs = costs or Costs()` in _Base, or
+#    `costs=costs or Costs()` at the LiveContext call in Context.deploy.
+lc_nc = LiveContext(["AMD"], 10_000)          # exactly what deploy(costs=None) builds
+lc_nc._ingest(candles("AMD", [100]))
+try:
+    lc_nc.order(mkorder("AMD", "BUY", 1))
+    check("deploy default (costs=None) can paper-fill", True)
+except AttributeError as e:
+    check("deploy default (costs=None) can paper-fill", False, f"{e}")
+
+# 2. `cash` accepts anything: backtest(strategy, tickers, 60, Costs_Zero()) binds Costs to CASH.
+#    It stays hidden until the viewer JSON-encodes portfolio_value, far from the real mistake.
+try:
+    bad = BacktestContext(["AMD"], Costs_Zero(), Costs())   # a Costs bound to the CASH slot
+    ok = not isinstance(bad.portfolio_value(), Costs)       # passes if it is rejected OR harmless
+    why = "silently accepted; surfaces later as 'Object of type Costs is not JSON serializable'"
+except TypeError:
+    ok, why = True, ""                                      # rejected at construction: correct
+check("a Costs in the cash slot is rejected early", ok, why)
 
 print("\n== live order path: rejection must not book ==========")
 class Resp:
@@ -267,7 +359,7 @@ check("parsed events all tagged", all(e["type"] == k for k in ("l1", "l2")
       for e in d.parse(l1 if k == "l1" else book_msg)[k]))
 
 print("\n== level-1 merge semantics ===========================")
-m = BacktestContext(["AMD"])
+m = BacktestContext(["AMD"], 10_000, Costs())
 m._ingest([{"symbol": "AMD", "time": 1, "bid": 10.0, "ask": 10.1, "last": 10.05,
             "bid_size": 100, "ask_size": 200, "type": "l1"}])
 m._ingest([{"symbol": "AMD", "time": 2, "bid": 10.2, "ask": None, "last": None,
@@ -307,7 +399,7 @@ d.subscribe(fs, ["AMD", "GE"], chart=True, level1=True, level2=True)
 check("no client: level-2 falls back instead of crashing",
       ("nasdaq", "AMD,GE") in fs.sent and ("chart", "AMD,GE") in fs.sent, f"{fs.sent}")
 
-print("\n== end-to-end backtest through Trader ================")
+print("\n== end-to-end backtest through Context ===============")
 class HistClient:
     """Minimal price_history/quotes client backed by a deterministic sine wave."""
     def price_history(self, symbol, **kw):
@@ -323,7 +415,7 @@ class HistClient:
         return type("R", (), {"ok": True, "json": lambda self: {s: {"reference": {"exchangeName": "NASDAQ"}} for s in syms}})()
 
 tmp = os.path.join(tempfile.mkdtemp(), "e2e.db")
-t = Trader(HistClient(), cache_db=tmp)
+t = Context(HistClient(), cache_db=tmp)
 
 class Strat:
     """Buy the dip, sell the rip — enough round trips to make the stats meaningful."""
@@ -371,7 +463,7 @@ check("payload is JSON-serializable", isinstance(json.dumps(pl), str))
 
 print("\n== thread safety of the ledger read ==================")
 import threading
-live2 = LiveContext(["AMD"], 100_000, client=None, account_hash=None)
+live2 = LiveContext(["AMD"], 100_000, costs=Costs())
 live2._ingest(candles("AMD", [100]))
 stop = False
 errors = []
@@ -393,7 +485,7 @@ check("no races between stream writer and viewer reader", not errors, f"{errors[
 
 print("\n== type tags & timestamp grouping ====================")
 ticks = []
-t_g = Trader(HistClient(), cache_db=os.path.join(tempfile.mkdtemp(), "g.db"))
+t_g = Context(HistClient(), cache_db=os.path.join(tempfile.mkdtemp(), "g.db"))
 t_g.backtest(lambda tc, ev: ticks.append(ev), ["AMD", "INTC"], history_days=1, report=False)
 check("every event the strategy sees is tagged",
       all(e["type"] == "c" for tick in ticks for e in tick))
@@ -402,8 +494,8 @@ check("same-timestamp candles of both tickers share one step",
       f"sizes={sorted(set(len(t) for t in ticks))}")
 check("steps are chronological",
       all(a[0]["time"] < b[0]["time"] for a, b in zip(ticks, ticks[1:])))
-check("get_events output is tagged", True)  # covered by 'recorded l1/l2 read back' + below
-ev_t = d.get_events("AMD", 3650, level1=True, level2=True)
+d2 = Data(cache_db=d.db_path)      # d was closed above; Data is single-use after close()
+ev_t = d2.get_events("AMD", 3650, level1=True, level2=True)
 check("stored l1/l2 come back tagged", [e["type"] for e in ev_t] == ["l1", "l2"], f"{ev_t}")
 
 print("\n" + "="*54)

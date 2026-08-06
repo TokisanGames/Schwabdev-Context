@@ -24,34 +24,8 @@ def dec(node):
     return 0.0
 
 
-class Costs:
-    """Transaction-cost model applied at fill time (simulation only). `apply` returns the
-    effective execution price (reference price moved against you by half-spread + slippage) and
-    the cash fee (flat + per-share + percentage, plus sell-only SEC/FINRA regulatory fees).
-
-    `worst` caps the price for orders that legally cannot fill through their own level: a BUY LIMIT
-    never pays more than the limit, a SELL LIMIT never receives less. Slippage on a limit order
-    shows up as a missed fill in reality, not a worse price."""
-
-    def __init__(self, flat=0.0, per_share=0.0, pct=0.00_05, half_spread=0.0, slip=0.0, sec_fee=20.60e-6, taf_per_share=0.000195):
-        self.flat, self.per_share, self.pct = flat, per_share, pct
-        self.half_spread, self.slip = half_spread, slip
-        self.sec_fee, self.taf = sec_fee, taf_per_share
-
-    def apply(self, instruction, qty, ref_price, limit=None):
-        side = 1 if instruction == "BUY" else -1
-        exec_price = ref_price * (1 + side * (self.half_spread + self.slip))
-        if limit is not None:                                # can't fill through your own limit
-            exec_price = min(exec_price, limit) if side > 0 else max(exec_price, limit)
-        exec_price = max(exec_price, 0.0)
-        fee = self.flat + self.per_share * qty + self.pct * qty * exec_price
-        if instruction == "SELL":                            # regulatory: sells only
-            fee += self.sec_fee * qty * exec_price + self.taf * qty
-        return exec_price, fee
-
-
-class Context:
-    def __init__(self, tickers, cash=10_000, costs=None, fill_delay=2):
+class _Base:
+    def __init__(self, tickers, cash, costs, fill_delay):
         self.tickers = [t.upper() for t in tickers]
         self.candles = {t: [] for t in self.tickers}  # symbol -> [candle, ...] seen so far; latest is candles[s][-1]
         self.quotes = {}            # symbol -> latest level-1 quote {"time","bid","ask","last","bid_size","ask_size"}
@@ -59,7 +33,7 @@ class Context:
         self.plots = {}             # overlay name -> [(time, value), ...]
         self.positions = {}         # symbol -> shares owned (float); absent/0 == flat
         self.orders = {}            # symbol -> order_id -> record (see `_open`)
-        self.costs = costs if isinstance(costs, Costs) else Costs()
+        self.costs = costs
         self.fill_delay = fill_delay
         self.fees_paid = 0.0        # cumulative simulated commission/fees
         self._starting_cash = cash
@@ -378,7 +352,7 @@ class Context:
         return report(self)
 
 
-class BacktestContext(Context):
+class BacktestContext(_Base):
     """A single, self-contained backtest: its own candles / orders / positions / cash / overlays /
     stats. Keep several around to compare strategies/parameter sets without interference.
 
@@ -388,9 +362,9 @@ class BacktestContext(Context):
     `step()` also records an equity curve (one point per tick that carried a candle), which is what
     lets `analysis` report max drawdown and a Sharpe ratio rather than just a net return."""
 
-    def __init__(self, tickers, cash=10_000, costs=None, fill_delay=2, track_equity=True):
-        super().__init__(tickers, cash, costs=costs, fill_delay=fill_delay)
-        self.equity = []                 # [(time_ms, portfolio_value), ...]
+    def __init__(self, tickers, cash, costs, fill_delay=2, track_equity=True):
+        super().__init__(tickers, cash, costs, fill_delay)
+        self.equity = [] # [(time_ms, portfolio_value), ...]
         self.track_equity = track_equity
 
     def step(self, strategy, events, notify=True):
@@ -401,7 +375,7 @@ class BacktestContext(Context):
                 self.equity.append((max(times), self.portfolio_value()))
 
 
-class LiveContext(Context):
+class LiveContext(_Base):
     """The live trading session.
 
     With a client and account hash, orders are routed to Schwab and fills arrive later on the
@@ -412,11 +386,12 @@ class LiveContext(Context):
     (Filling a resting limit the moment it is placed — at its own price, whatever the market was
     doing — is the one way paper results can flatter a strategy without bound.)"""
 
-    def __init__(self, tickers, cash, client=None, account_hash=None, costs=None):
-        super().__init__(tickers, cash, costs=costs, fill_delay=0)
+    def __init__(self, tickers, cash=0, client=None, account_hash=None, costs=None, safety=True):
+        super().__init__(tickers, cash, costs, fill_delay=0)
         self._client = client
         self._account_hash = account_hash
-        self._executions = set()   # ExecutionIds already booked (the stream can repeat them)
+        self.safety = safety # refuse orders priced >5% through the market (see _check_safe)
+        self._executions = set() # ExecutionIds already booked (the stream can repeat them)
         self._streamer = None
 
     @property
@@ -454,8 +429,30 @@ class LiveContext(Context):
                         self.positions[sym] = qty
             return self._cash
 
+    SAFETY_PCT = 0.05
+
+    def _check_safe(self, parsed):
+        """Refuse an order priced dangerously through the market: a BUY more than SAFETY_PCT above,
+        or a SELL more than SAFETY_PCT below, the minimum of the most recent OHLC candle. Catches
+        fat-fingered limits and strategies acting on stale prices before anything reaches the
+        broker — or the paper ledger, so paper results stay honest too. With no candle yet there is
+        no reference, so nothing is blocked (`_parse` has already required a price)."""
+        cs = self.candles.get(parsed["symbol"])
+        if not self.safety or not cs:
+            return
+        c = cs[-1]
+        ref = min(c["open"], c["high"], c["low"], c["close"])
+        side, price = parsed["instruction"], parsed["price"]
+        if side == "BUY" and price > ref * (1 + self.SAFETY_PCT):
+            raise ValueError(f"safety: BUY {parsed['symbol']} at {price:.2f} is more than "
+                             f"{self.SAFETY_PCT:.0%} above the market ({ref:.2f})")
+        if side == "SELL" and price < ref * (1 - self.SAFETY_PCT):
+            raise ValueError(f"safety: SELL {parsed['symbol']} at {price:.2f} is more than "
+                             f"{self.SAFETY_PCT:.0%} below the market ({ref:.2f})")
+
     def order(self, order):
         parsed = self._parse(order)  # validate before anything leaves this process
+        self._check_safe(parsed)     # then refuse unsafe prices (safety=True)
         if not self.live_orders:
             return super().order(order)                    # paper: simulate, same as a backtest
 
