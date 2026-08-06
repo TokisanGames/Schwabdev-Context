@@ -3,22 +3,6 @@ import threading
 import time as _time
 
 
-def find(o, key):
-    """First value for `key` found anywhere in a nested dict/list, else None."""
-    if isinstance(o, dict):
-        if key in o:
-            return o[key]
-        for v in o.values():
-            r = find(v, key)
-            if r is not None:
-                return r
-    elif isinstance(o, list):
-        for v in o:
-            r = find(v, key)
-            if r is not None:
-                return r
-    return None
-
 
 def dec(node):
     """Decode a Schwab decimal node, e.g. {"lo": "220470000", "signScale": 12} -> 220.47.
@@ -49,9 +33,7 @@ class Costs:
     never pays more than the limit, a SELL LIMIT never receives less. Slippage on a limit order
     shows up as a missed fill in reality, not a worse price."""
 
-    def __init__(self, flat=0.0, per_share=0.0, pct=0.00_05,
-                 half_spread=0.0, slip=0.0,
-                 sec_fee=20.60e-6, taf_per_share=0.000195):
+    def __init__(self, flat=0.0, per_share=0.0, pct=0.00_05, half_spread=0.0, slip=0.0, sec_fee=20.60e-6, taf_per_share=0.000195):
         self.flat, self.per_share, self.pct = flat, per_share, pct
         self.half_spread, self.slip = half_spread, slip
         self.sec_fee, self.taf = sec_fee, taf_per_share
@@ -69,16 +51,6 @@ class Costs:
 
 
 class Context:
-    # Account-activity event types (field "2" of an ACCT_ACTIVITY message). Matched by keyword
-    # against the upper-cased type, so new spellings of the same event still land in the right
-    # bucket — but the keywords must NOT be so loose that a routing/lifecycle event looks like a
-    # fill. "ExecutionRequested", "ExecutionRequestCreated", "ExecutionRequestCompleted" and
-    # "ExecutionCreated" are all lifecycle events that carry an ExecutionQuantity; only a
-    # *FillCompleted event books shares.
-    _FILL_TYPES = ("FILLCOMPLETED", "FILLED")
-    _OUT_TYPES = ("UROUT", "CANCELACCEPTED", "CANCELED", "CANCELLED",
-                  "REJECT", "EXPIRE", "EXPIRED")
-
     def __init__(self, tickers, cash=10_000, costs=None, fill_delay=2):
         self.tickers = [t.upper() for t in tickers]
         self.candles = {t: [] for t in self.tickers}  # symbol -> [candle, ...] seen so far; latest is candles[s][-1]
@@ -113,30 +85,29 @@ class Context:
         return max(times) if times else int(_time.time() * 1000)
 
     def _ingest(self, events):
-        """Route one tick's mixed batch of events into the market-data stores. Level-2 snapshots
-        replace the book; level-1 quotes MERGE into the previous quote (the stream sends deltas, so
-        unchanged fields arrive as None); candles append to the per-symbol history — except a repeat
-        of the newest timestamp, which REPLACES it, because the chart stream re-sends the forming
-        minute bar until it closes (the same reason `Data.write` uses INSERT OR REPLACE). Appending
-        those would duplicate minutes, inflating the bar count `_settle_pending` measures its fill
-        delay in. Events are told apart by shape: candles carry "open", books carry "bids"/"asks",
-        quotes carry "bid"."""
+        """Route one tick's mixed batch of events into the market-data stores by their "type" tag
+        ("c" candle / "l1" quote / "l2" book). Level-2 snapshots replace the book; level-1 quotes
+        MERGE into the previous quote (the stream sends deltas, so unchanged fields arrive as
+        None); candles append to the per-symbol history — except a repeat of the newest timestamp,
+        which REPLACES it, because the chart stream re-sends the forming minute bar until it closes
+        (the same reason `Data.write` uses INSERT OR REPLACE). Appending those would duplicate
+        minutes, inflating the bar count `_settle_pending` measures its fill delay in."""
         for e in events:
             symbol = e["symbol"]
-            if "open" in e:                                   # chart candle
+            if e["type"] == "c":                              # chart candle
                 cs = self.candles.setdefault(symbol, [])
                 if cs and cs[-1]["time"] == e["time"]:
                     cs[-1] = e                                # forming bar re-sent: overwrite
                 else:
                     cs.append(e)
-            elif "bids" in e or "asks" in e:                  # level-2 book snapshot
+            elif e["type"] == "l2":                           # level-2 book snapshot
                 self.books[symbol] = e
             else:                                             # level-1 quote delta
                 quote = self.quotes.setdefault(symbol, {})
                 quote.update({k: v for k, v in e.items() if v is not None})
 
     def step(self, strategy, events, notify=True):
-        """One tick, shared by backtest replay, warm-up preload and the live stream: advance time
+        """One tick, shared by backtest replay and the live stream: advance time
         with the new events (candles / quotes / books), settle orders resting from earlier ticks
         against the candles, then run the strategy (whose new orders settle on a later step).
 
@@ -425,7 +396,7 @@ class BacktestContext(Context):
     def step(self, strategy, events, notify=True):
         super().step(strategy, events, notify=notify)
         if self.track_equity:
-            times = [e["time"] for e in events if "open" in e]
+            times = [e["time"] for e in events if e["type"] == "c"]
             if times:
                 self.equity.append((max(times), self.portfolio_value()))
 
@@ -445,8 +416,8 @@ class LiveContext(Context):
         super().__init__(tickers, cash, costs=costs, fill_delay=0)
         self._client = client
         self._account_hash = account_hash
-        self.warming = False       # True while replaying preloaded history: orders are ignored
         self._executions = set()   # ExecutionIds already booked (the stream can repeat them)
+        self._streamer = None
 
     @property
     def live_orders(self):
@@ -484,8 +455,6 @@ class LiveContext(Context):
             return self._cash
 
     def order(self, order):
-        if self.warming:
-            return None  # warm-up replay: the strategy runs, but nothing is placed or filled
         parsed = self._parse(order)  # validate before anything leaves this process
         if not self.live_orders:
             return super().order(order)                    # paper: simulate, same as a backtest
@@ -508,7 +477,7 @@ class LiveContext(Context):
         # accepted but no id => filled on the spot, and no stream fill will reference it; book it
         rec = self._open(parsed, order, sim=False)
         self._fill(rec, rec["quantity"], parsed["price"])
-        return rec["id"]
+        return rec["id"]        
 
     def cancel(self, order_id):
         """Route the cancel to Schwab before marking the local record. Marking it locally first is
@@ -542,6 +511,26 @@ class LiveContext(Context):
         part of the CANCEL path. Treating "contains EXECUTION" as a fill books cancels as
         purchases. Executions are also de-duplicated by ExecutionId, since a repeat of the same
         message would otherwise double the position."""
+
+        _FILL_TYPES = ("FILLCOMPLETED", "FILLED")
+        _OUT_TYPES = ("UROUT", "CANCELACCEPTED", "CANCELED", "CANCELLED", "REJECT", "EXPIRE", "EXPIRED")
+
+        def find(o, key):
+            """First value for `key` found anywhere in a nested dict/list, else None."""
+            if isinstance(o, dict):
+                if key in o:
+                    return o[key]
+                for v in o.values():
+                    r = find(v, key)
+                    if r is not None:
+                        return r
+            elif isinstance(o, list):
+                for v in o:
+                    r = find(v, key)
+                    if r is not None:
+                        return r
+            return None
+
         msg_type = str(item.get("2", "")).upper()
         raw = item.get("3")
         if raw in (None, ""):
@@ -556,10 +545,10 @@ class LiveContext(Context):
         if rec is None or rec["status"] != "OPEN":
             return
 
-        if any(k in msg_type for k in self._OUT_TYPES):        # canceled / rejected / expired / UR-out
+        if any(k in msg_type for k in _OUT_TYPES):        # canceled / rejected / expired / UR-out
             with self._lock:
                 rec["status"] = "CANCELED"
-        elif any(k in msg_type for k in self._FILL_TYPES):     # an execution -> book what filled
+        elif any(k in msg_type for k in _FILL_TYPES):     # an execution -> book what filled
             trans = str(find(payload, "ExecutionTransType") or "FILL").upper()
             if "FILL" not in trans:                            # e.g. a UROut execution record
                 return

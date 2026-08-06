@@ -2,7 +2,6 @@
 Tools for analyzing backtest runs and charting.
 """
 
-import datetime
 import json as _json
 import threading
 import webbrowser

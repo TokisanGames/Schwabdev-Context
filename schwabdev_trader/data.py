@@ -1,19 +1,3 @@
-"""Data: the single gateway to the candle store — the ONLY class that touches the DB.
-
-Backtests read cached minute candles (and any recorded level-1 / level-2 events) from it; live
-recording writes candles / quotes / order-book snapshots into it. One SQLite table per ticker and
-data type:
-
-    chart_{ticker} : minute candles      (time PRIMARY KEY, open, high, low, close, volume)
-    l1_{ticker}    : level-one quotes    (time, bid, ask, last, bid_size, ask_size)
-    l2_{ticker}    : order-book snapshots (time, bids TEXT(json), asks TEXT(json))
-
-For candles, only the missing date ranges are fetched from Schwab (minute candles cap at
-10 days/request, so gaps are pulled in 10-day chunks). Schwab has NO history API for l1/l2 — those
-tables can only be populated live, via `record()` or a `Trader.deploy()` session (which records
-whatever it subscribes to through the same `parse`/`write` pair). With no client the store runs
-read-only, replaying purely from disk."""
-
 import contextlib
 import datetime
 import json
@@ -30,24 +14,14 @@ class Data:
     def __init__(self, cache_db="~/.schwabdev/candles.db", client=None):
         self.db_path = os.path.expanduser(cache_db)
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
-        self.client = client
-        self._con = None      # lazy write connection, used from the stream thread
-        self._tables = set()  # tables already ensured on the write connection
+        self._client = client
+        self._con = sqlite3.connect(self.db_path)
+        self._tables = set() 
 
     @staticmethod
     def table(prefix, ticker):
         """Per-ticker table name, e.g. ("chart", "BRK/B") -> "chart_BRK_B"."""
         return f"{prefix}_" + "".join(ch if ch.isalnum() else "_" for ch in ticker)
-
-    @contextlib.contextmanager
-    def _read(self):
-        """Short-lived read connection, always closed — `get_candles` makes network calls while
-        holding one, and an exception mid-fetch used to leak the handle (and its write lock)."""
-        con = sqlite3.connect(self.db_path)
-        try:
-            yield con
-        finally:
-            con.close()
 
     def close(self):
         """Close the streaming write connection, if one was opened."""
@@ -68,63 +42,61 @@ class Data:
         to_dt = lambda m: datetime.datetime.fromtimestamp(m / 1000, datetime.timezone.utc)
 
         table = self.table("chart", ticker)  # same table the chart-equity stream records to
-        with self._read() as con:
-            con.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({_CHART_DDL})')
+        self._con.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({_CHART_DDL})')
 
-            now = datetime.datetime.now(datetime.timezone.utc)
-            need_start = now - datetime.timedelta(days=history_days)
-            earliest, latest = con.execute(f'SELECT MIN(time), MAX(time) FROM "{table}"').fetchone()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        need_start = now - datetime.timedelta(days=history_days)
+        earliest, latest = self._con.execute(f'SELECT MIN(time), MAX(time) FROM "{table}"').fetchone()
 
-            # determine which ranges are missing from the cache
-            ranges = []
-            if latest is None:
-                ranges.append((need_start, now))                  # empty cache: full range
-            else:
-                ranges.append((to_dt(latest), now))               # recent gap (latest -> now)
-                if earliest > ms(need_start):
-                    ranges.append((need_start, to_dt(earliest)))  # backfill older history
+        # determine which ranges are missing from the cache
+        ranges = []
+        if latest is None:
+            ranges.append((need_start, now)) # empty cache: full range
+        else:
+            ranges.append((to_dt(latest), now)) # recent gap (latest -> now)
+            if earliest > ms(need_start):
+                ranges.append((need_start, to_dt(earliest))) # backfill older history
 
-            # fetch each missing range in <=10-day chunks and cache it (INSERT OR IGNORE dedupes).
-            # with no client we run cache-only and skip all API calls.
-            for start, end in (ranges if self.client else []):
-                cur = end
-                while cur > start:
-                    chunk_start = max(start, cur - datetime.timedelta(days=10))
-                    data = self._fetch_candles(ticker, chunk_start, cur)
-                    if not data:
-                        break
-                    con.executemany(
-                        f'INSERT OR IGNORE INTO "{table}" (time, open, high, low, close, volume) VALUES (?,?,?,?,?,?)',
-                        [(c["datetime"], c["open"], c["high"], c["low"], c["close"], c["volume"])
-                         for c in data])
-                    con.commit()
-                    cur = chunk_start
-                    _time.sleep(0.5)  # rate-limit: 2 requests/sec
+        def _fetch_candles(self, ticker, start, end):
+            """One price-history request"""
+            try:
+                r = self._client.price_history(ticker, periodType="day", frequencyType="minute",
+                                            frequency=1, startDate=start, endDate=end,
+                                            needExtendedHoursData=False)
+            except Exception as exc:
+                print(f"[data] {ticker} price_history failed: {exc}")
+                return []
+            if not r.ok:
+                print(f"[data] {ticker} price_history {r.status_code} for "
+                    f"{start:%Y-%m-%d}..{end:%Y-%m-%d}")
+                return []
+            try:
+                return r.json().get("candles", []) or []
+            except ValueError:
+                return []
 
-            rows = con.execute(f'SELECT time, open, high, low, close, volume FROM "{table}" '
-                               "WHERE time >= ? ORDER BY time", (ms(need_start),)).fetchall()
-        return [{"symbol": ticker, "time": t, "open": o, "high": h, "low": l, "close": c, "volume": v}
-                for t, o, h, l, c, v in rows]
+        # fetch each missing range in <=10-day chunks and cache it (INSERT OR IGNORE dedupes).
+        # with no client we run cache-only and skip all API calls.
+        for start, end in (ranges if self._client else []):
+            cur = end
+            while cur > start:
+                chunk_start = max(start, cur - datetime.timedelta(days=10))
+                data = self._fetch_candles(ticker, chunk_start, cur)
+                if not data:
+                    break
+                self._con.executemany(
+                    f'INSERT OR IGNORE INTO "{table}" (time, open, high, low, close, volume) VALUES (?,?,?,?,?,?)',
+                    [(c["datetime"], c["open"], c["high"], c["low"], c["close"], c["volume"])
+                        for c in data])
+                self._con.commit()
+                cur = chunk_start
+                _time.sleep(0.5)  # rate-limit: 2 requests/sec
 
-    def _fetch_candles(self, ticker, start, end):
-        """One price-history request, returning the raw candle list (empty on any failure). Network
-        and HTTP errors are logged rather than raised: a 90-day backfill spans many requests, and
-        one bad chunk should not lose the cache work already committed."""
-        try:
-            r = self.client.price_history(ticker, periodType="day", frequencyType="minute",
-                                          frequency=1, startDate=start, endDate=end,
-                                          needExtendedHoursData=False)
-        except Exception as exc:
-            print(f"[data] {ticker} price_history failed: {exc}")
-            return []
-        if not r.ok:
-            print(f"[data] {ticker} price_history {r.status_code} for "
-                  f"{start:%Y-%m-%d}..{end:%Y-%m-%d}")
-            return []
-        try:
-            return r.json().get("candles", []) or []
-        except ValueError:
-            return []
+        rows = self._con.execute(f'SELECT time, open, high, low, close, volume FROM "{table}" '
+                            "WHERE time >= ? ORDER BY time", (ms(need_start),)).fetchall()
+        return [{"symbol": ticker, "time": t, "open": o, "high": h, "low": l, "close": c,
+                 "volume": v, "type": "c"} for t, o, h, l, c, v in rows]
+
 
     def get_events(self, ticker, history_days, level1=False, level2=False):
         """Chronological RECORDED level-1 quotes / level-2 book snapshots for `ticker` over the
@@ -134,32 +106,33 @@ class Data:
         since = int((datetime.datetime.now(datetime.timezone.utc)
                      - datetime.timedelta(days=history_days)).timestamp() * 1000)
         events = []
-        with self._read() as con:
-            exists = lambda t: con.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()
+        exists = lambda t: self._con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()
 
-            if level1 and exists(t := self.table("l1", ticker)):
-                for time, bid, ask, last, bsz, asz in con.execute(
-                        f'SELECT time, bid, ask, last, bid_size, ask_size FROM "{t}" '
-                        "WHERE time >= ? ORDER BY time", (since,)):
-                    events.append({"symbol": ticker, "time": time, "bid": bid, "ask": ask,
-                                   "last": last, "bid_size": bsz, "ask_size": asz})
-            if level2 and exists(t := self.table("l2", ticker)):
-                for time, bids, asks in con.execute(
-                        f'SELECT time, bids, asks FROM "{t}" WHERE time >= ? ORDER BY time', (since,)):
-                    events.append({"symbol": ticker, "time": time,
-                                   "bids": json.loads(bids or "[]"), "asks": json.loads(asks or "[]")})
+        if level1 and exists(t := self.table("l1", ticker)):
+            for time, bid, ask, last, bsz, asz in self._con.execute(
+                    f'SELECT time, bid, ask, last, bid_size, ask_size FROM "{t}" '
+                    "WHERE time >= ? ORDER BY time", (since,)):
+                events.append({"symbol": ticker, "time": time, "bid": bid, "ask": ask,
+                                "last": last, "bid_size": bsz, "ask_size": asz, "type": "l1"})
+        if level2 and exists(t := self.table("l2", ticker)):
+            for time, bids, asks in self._con.execute(
+                    f'SELECT time, bids, asks FROM "{t}" WHERE time >= ? ORDER BY time', (since,)):
+                events.append({"symbol": ticker, "time": time, "type": "l2",
+                                "bids": json.loads(bids or "[]"), "asks": json.loads(asks or "[]")})
         events.sort(key=lambda e: e["time"])
         return events
 
     # streaming (shared by record() and Trader.deploy()) ----------------------
 
     def parse(self, msg):
-        """Decode one raw stream message into normalized events, keyed by kind:
-            chart    : {"symbol","time","open","high","low","close","volume"}
-            l1       : {"symbol","time","bid","ask","last","bid_size","ask_size"}
+        """Decode one raw stream message into normalized events, keyed by kind. Every market
+        event also carries a "type" tag ("c" candle / "l1" quote / "l2" book) so consumers never
+        have to sniff its shape:
+            chart    : {"symbol","time","open","high","low","close","volume","type":"c"}
+            l1       : {"symbol","time","bid","ask","last","bid_size","ask_size","type":"l1"}
                        (level-one streams DELTAS: unchanged fields arrive as None)
-            l2       : {"symbol","time","bids","asks"}  (full book snapshots)
+            l2       : {"symbol","time","bids","asks","type":"l2"}  (full book snapshots)
             activity : the raw ACCT_ACTIVITY content item, untouched
         This is the one place stream field numbers are interpreted; everything downstream
         (recording via `write`, the live session, backtest replay) speaks these dicts.
@@ -181,7 +154,7 @@ class Data:
                 if svc == "CHART_EQUITY":
                     candle = {"symbol": sym, "open": it.get("2"), "high": it.get("3"),
                               "low": it.get("4"), "close": it.get("5"),
-                              "volume": it.get("6", 0.0), "time": it.get("7")}
+                              "volume": it.get("6", 0.0), "time": it.get("7"), "type": "c"}
                     if sym and candle["time"] is not None and None not in (
                             candle["open"], candle["high"], candle["low"], candle["close"]):
                         events["chart"].append(candle)
@@ -189,10 +162,11 @@ class Data:
                     if sym:
                         events["l1"].append({"symbol": sym, "time": ts, "bid": it.get("1"),
                                              "ask": it.get("2"), "last": it.get("3"),
-                                             "bid_size": it.get("4"), "ask_size": it.get("5")})
+                                             "bid_size": it.get("4"), "ask_size": it.get("5"),
+                                             "type": "l1"})
                 elif svc in ("NASDAQ_BOOK", "NYSE_BOOK"):
                     if sym:
-                        events["l2"].append({"symbol": sym, "time": it.get("1", ts),
+                        events["l2"].append({"symbol": sym, "time": it.get("1", ts), "type": "l2",
                                              "bids": it.get("2") or [], "asks": it.get("3") or []})
                 elif svc == "ACCT_ACTIVITY":
                     events["activity"].append(it)
@@ -260,11 +234,11 @@ class Data:
 
     def _split_by_exchange(self, tickers):
         """(nasdaq, nyse) split of `tickers` by listing exchange, for book subscriptions."""
-        if not self.client:
+        if not self._client:
             print("[data] no client: routing all level-2 subscriptions to NASDAQ_BOOK")
             return list(tickers), []
         try:
-            r = self.client.quotes(list(tickers))
+            r = self._client.quotes(list(tickers))
             q = r.json() if r.ok else {}
         except Exception as exc:
             print(f"[data] exchange lookup failed ({exc}); routing level-2 to NASDAQ_BOOK")
@@ -301,7 +275,7 @@ class Data:
 
         import schwabdev
         tickers = [t.strip().upper() for t in tickers]
-        streamer = schwabdev.Stream(self.client)
+        streamer = schwabdev.Stream(self._client)
         streamer.start_auto(handle, daemon=False, **start_auto_kwargs)
         _time.sleep(1.0)  # let the socket finish connecting before subscriptions are sent
         self.subscribe(streamer, tickers, chart=chart, level1=level1, level2=level2)

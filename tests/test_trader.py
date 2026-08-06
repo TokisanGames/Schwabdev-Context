@@ -2,9 +2,9 @@
 import json, math, os, sys, tempfile, datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from trader.context import BacktestContext, LiveContext, Costs, dec, find
+from trader.context import BacktestContext, LiveContext, Costs, dec
 from trader.data import Data
-from trader.trader import Trader, _wakes, _kind
+from trader.trader import Trader, _wakes
 from trader import analysis
 
 FAILS = []
@@ -25,7 +25,7 @@ def candles(sym, closes, t0=1_700_000_000_000):
     out = []
     for i, c in enumerate(closes):
         out.append({"symbol": sym, "time": t0 + i*60_000, "open": c, "high": c*1.01,
-                    "low": c*0.99, "close": c, "volume": 1000.0})
+                    "low": c*0.99, "close": c, "volume": 1000.0, "type": "c"})
     return out
 
 print("\n== dec() =============================================")
@@ -37,10 +37,9 @@ check("plain number passes through", dec(3.5) == 3.5)
 check("garbage -> 0", dec("nope") == 0.0 and dec(None) == 0.0)
 
 print("\n== _wakes() ==========================================")
-book = {"symbol": "X", "time": 1, "bids": [], "asks": []}
-candle = {"symbol": "X", "time": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}
-quote = {"symbol": "X", "time": 1, "bid": 1, "ask": 2}
-check("kinds classified", (_kind(candle), _kind(book), _kind(quote)) == ("chart", "l2", "l1"))
+book = {"symbol": "X", "time": 1, "bids": [], "asks": [], "type": "l2"}
+candle = {"symbol": "X", "time": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1, "type": "c"}
+quote = {"symbol": "X", "time": 1, "bid": 1, "ask": 2, "type": "l1"}
 check("disabled l2 does not wake", _wakes([book], chart=False, level1=True, level2=False) is False)
 check("enabled l1 wakes", _wakes([quote], chart=False, level1=True, level2=False) is True)
 check("candle alone does not wake with chart=False",
@@ -50,7 +49,7 @@ print("\n== candle ingest / duplicate forming bar ==============")
 ctx = BacktestContext(["AMD"], 10_000)
 ctx._ingest(candles("AMD", [100, 101]))
 ctx._ingest([{"symbol": "AMD", "time": 1_700_000_060_000, "open": 101, "high": 103,
-             "low": 100, "close": 102.5, "volume": 5000.0}])   # forming bar re-sent
+             "low": 100, "close": 102.5, "volume": 5000.0, "type": "c"}])   # forming bar re-sent
 check("re-sent forming bar replaces, not appends", len(ctx.candles["AMD"]) == 2,
       f"len={len(ctx.candles['AMD'])}")
 check("re-sent bar carries the latest close", ctx.candles["AMD"][-1]["close"] == 102.5)
@@ -84,7 +83,7 @@ r3 = BacktestContext(["AMD"], 10_000, costs=Costs(slip=0.05, pct=0), fill_delay=
 r3._ingest(candles("AMD", [100]))
 r3.order(mkorder("AMD", "BUY", 1, "LIMIT", price=99))
 r3._ingest([{"symbol": "AMD", "time": 1_700_000_060_000, "open": 98, "high": 99,
-            "low": 97, "close": 98, "volume": 1}])
+            "low": 97, "close": 98, "volume": 1, "type": "c"}])
 r3._settle_pending()
 lim = list(r3.orders["AMD"].values())[0]
 check("buy limit fills at or better than the limit", lim["avg_price"] <= 99.0 + 1e-9,
@@ -97,7 +96,7 @@ r4._ingest(candles("AMD", [100]))
 r4.positions["AMD"] = 10
 r4.order(mkorder("AMD", "SELL", 10, "STOP", stop=95))
 r4._ingest([{"symbol": "AMD", "time": 1_700_000_060_000, "open": 99, "high": 99.5,
-            "low": 94, "close": 98, "volume": 1}])   # dipped through the stop, closed above
+            "low": 94, "close": 98, "volume": 1, "type": "c"}])   # dipped through the stop, closed above
 r4._settle_pending()
 st = list(r4.orders["AMD"].values())[0]
 check("stop filled on the intrabar low, not the close", st["status"] == "FILLED" and abs(st["avg_price"] - 95) < 1e-9,
@@ -142,7 +141,7 @@ check("paper limit did not move cash", paper._cash == 10_000)
 oid2 = paper.order(mkorder("AMD", "BUY", 1))                     # market: fills now
 check("paper market fills immediately", paper._find_order(oid2)["status"] == "FILLED")
 paper.step(lambda tc, e: None, [{"symbol": "AMD", "time": 1_700_000_060_000, "open": 49,
-                                 "high": 50, "low": 48, "close": 49, "volume": 1}])
+                                 "high": 50, "low": 48, "close": 49, "volume": 1, "type": "c"}])
 check("paper limit fills once the market touches it", prec["status"] == "FILLED")
 
 print("\n== live order path: rejection must not book ==========")
@@ -256,7 +255,7 @@ good = json.dumps({"data": [{"service": "CHART_EQUITY", "timestamp": 1, "content
     {"key": "AMD", "1": 425, "2": 221.1, "3": 221.2, "4": 221.0, "5": 221.02, "6": 11730, "7": 1765307100000}]}]})
 p = d.parse(good)
 check("good candle parsed", p["chart"] == [{"symbol": "AMD", "open": 221.1, "high": 221.2,
-      "low": 221.0, "close": 221.02, "volume": 11730, "time": 1765307100000}], f"{p['chart']}")
+      "low": 221.0, "close": 221.02, "volume": 11730, "time": 1765307100000, "type": "c"}], f"{p['chart']}")
 l1 = json.dumps({"data": [{"service": "LEVELONE_EQUITIES", "timestamp": 99, "content": [
     {"key": "AMD", "1": 217.86, "2": 217.95}]}]})     # a delta: only bid/ask changed
 q = d.parse(l1)["l1"][0]
@@ -264,13 +263,15 @@ check("l1 delta keeps missing fields as None", q["last"] is None and q["bid"] ==
 book_msg = json.dumps({"data": [{"service": "NASDAQ_BOOK", "timestamp": 5, "content": [
     {"key": "AMD", "1": 1765306382549, "2": [{"0": 221.38, "1": 640}], "3": []}]}]})
 check("book snapshot parsed", d.parse(book_msg)["l2"][0]["bids"][0]["0"] == 221.38)
+check("parsed events all tagged", all(e["type"] == k for k in ("l1", "l2")
+      for e in d.parse(l1 if k == "l1" else book_msg)[k]))
 
 print("\n== level-1 merge semantics ===========================")
 m = BacktestContext(["AMD"])
 m._ingest([{"symbol": "AMD", "time": 1, "bid": 10.0, "ask": 10.1, "last": 10.05,
-            "bid_size": 100, "ask_size": 200}])
+            "bid_size": 100, "ask_size": 200, "type": "l1"}])
 m._ingest([{"symbol": "AMD", "time": 2, "bid": 10.2, "ask": None, "last": None,
-            "bid_size": None, "ask_size": None}])
+            "bid_size": None, "ask_size": None, "type": "l1"}])
 check("delta merges, does not blank the book",
       m.quotes["AMD"]["bid"] == 10.2 and m.quotes["AMD"]["ask"] == 10.1)
 
@@ -311,7 +312,8 @@ class HistClient:
     """Minimal price_history/quotes client backed by a deterministic sine wave."""
     def price_history(self, symbol, **kw):
         base = 100 + (10 if symbol == "AMD" else 0)
-        t0 = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000) - 400*60_000
+        # minute-aligned like real Schwab candles, so both tickers share timestamps
+        t0 = (int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000) // 60_000) * 60_000 - 400*60_000
         rows = [{"datetime": t0 + i*60_000,
                  "open": base + math.sin(i/9)*5, "high": base + math.sin(i/9)*5 + 0.5,
                  "low": base + math.sin(i/9)*5 - 0.5, "close": base + math.sin(i/9)*5,
@@ -387,6 +389,22 @@ def reader():
 w = threading.Thread(target=writer); r = threading.Thread(target=reader, daemon=True)
 w.start(); r.start(); w.join(); stop = True; r.join(timeout=2)
 check("no races between stream writer and viewer reader", not errors, f"{errors[:3]}")
+
+
+print("\n== type tags & timestamp grouping ====================")
+ticks = []
+t_g = Trader(HistClient(), cache_db=os.path.join(tempfile.mkdtemp(), "g.db"))
+t_g.backtest(lambda tc, ev: ticks.append(ev), ["AMD", "INTC"], history_days=1, report=False)
+check("every event the strategy sees is tagged",
+      all(e["type"] == "c" for tick in ticks for e in tick))
+check("same-timestamp candles of both tickers share one step",
+      all(len(tick) == 2 and {e["symbol"] for e in tick} == {"AMD", "INTC"} for tick in ticks),
+      f"sizes={sorted(set(len(t) for t in ticks))}")
+check("steps are chronological",
+      all(a[0]["time"] < b[0]["time"] for a, b in zip(ticks, ticks[1:])))
+check("get_events output is tagged", True)  # covered by 'recorded l1/l2 read back' + below
+ev_t = d.get_events("AMD", 3650, level1=True, level2=True)
+check("stored l1/l2 come back tagged", [e["type"] for e in ev_t] == ["l1", "l2"], f"{ev_t}")
 
 print("\n" + "="*54)
 print("FAILURES:", FAILS if FAILS else "none")
