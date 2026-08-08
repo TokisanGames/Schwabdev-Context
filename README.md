@@ -6,7 +6,7 @@ To install run `pip install schwabdev[context]`
 
 Schwabdev Trader Context documentation is hosted in the [main Schwabdev docs](https://tylerebowers.github.io/Schwabdev/?source=pages%2Fwelcome.html).
 
-## MIT License
+### MIT License
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
