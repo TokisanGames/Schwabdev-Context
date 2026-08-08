@@ -10,6 +10,7 @@ class Context:
         """`safety` (default on) makes the live session refuse orders priced dangerously far from
         the market — a BUY more than 5% above, or a SELL more than 5% below, the minimum of the
         most recent OHLC candle. It guards live/paper sessions only; backtests are unaffected."""
+        print("SCHWABDEV CONTEXT IS IN DEVELOPMENT, USE AT YOUR OWN RISK")
         if account_hash and not client:
             raise ValueError("client and account_hash are required for live trading (hint: client.linked_accounts().json())")
         self._client = client

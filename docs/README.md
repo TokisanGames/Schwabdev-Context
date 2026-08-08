@@ -1,0 +1,1 @@
+## Schwabdev Trader Context documentation is hosted in the [main Schwabdev docs](https://tylerebowers.github.io/Schwabdev/?source=pages%2Fwelcome.html).
