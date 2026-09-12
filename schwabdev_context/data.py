@@ -34,10 +34,11 @@ class Data:
 
     # reading (backtest) ------------------------------------------------------
 
-    def get_candles(self, ticker, history_days):
+    def get_candles(self, ticker, history_days, extended_hours=False):
         """Chronological minute candles for `ticker` over the last `history_days`. Missing ranges
         are fetched via the client (when one is set) and cached; everything is read back from
-        SQLite."""
+        SQLite. `extended_hours` requests pre/after-market candles from Schwab for any range
+        that has to be fetched."""
         ms = lambda d: int(d.timestamp() * 1000)
         to_dt = lambda m: datetime.datetime.fromtimestamp(m / 1000, datetime.timezone.utc)
 
@@ -62,7 +63,7 @@ class Data:
             cur = end
             while cur > start:
                 chunk_start = max(start, cur - datetime.timedelta(days=10))
-                data = self._fetch_candles(ticker, chunk_start, cur)
+                data = self._fetch_candles(ticker, chunk_start, cur, extended_hours)
                 if not data:
                     break
                 self._con.executemany(
@@ -79,12 +80,13 @@ class Data:
                  "volume": v, "type": "c"} for t, o, h, l, c, v in rows]
 
 
-    def _fetch_candles(self, ticker, start, end):
-        """One price-history request, returning the raw candle list (empty on any failure)."""
+    def _fetch_candles(self, ticker, start, end, extended_hours=False):
+        """One price-history request, returning the raw candle list (empty on any failure).
+        `extended_hours` requests pre/after-market candles from Schwab."""
         try:
             r = self._client.price_history(ticker, periodType="day", frequencyType="minute",
                                            frequency=1, startDate=start, endDate=end,
-                                           needExtendedHoursData=False)
+                                           needExtendedHoursData=extended_hours)
         except Exception as exc:
             print(f"[data] {ticker} price_history failed: {exc}")
             return []
