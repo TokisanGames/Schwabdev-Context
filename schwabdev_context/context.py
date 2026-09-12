@@ -23,7 +23,8 @@ class Context:
     # backtesting -------------------------------------------------------------
 
     def backtest(self, strategy, tickers, history_days=90, cash=10_000, report=True, plot=False,
-                 chart=True, level1=False, level2=False, costs=None, fill_delay=2):
+                 chart=True, level1=False, level2=False, costs=None, fill_delay=2,
+                 extended_hours=False):
         """Replay cached data through `strategy` and return a backtest run.
 
         `chart`/`level1`/`level2` pick which event types are sent to the strategy. Candles are
@@ -33,7 +34,8 @@ class Context:
         events exist only where `Data.record()` or a live deploy previously captured them.
 
         `costs` (a `Costs` instance) sets the spread/slippage/fee model and `fill_delay` how many
-        candles a MARKET order waits before filling at that candle's open."""
+        candles a MARKET order waits before filling at that candle's open. `extended_hours`
+        requests pre/after-market candles from Schwab for any range that has to be fetched."""
         if costs is None: costs = Costs() # default values
         run = BacktestContext(tickers, cash, costs, fill_delay=fill_delay)
 
@@ -42,7 +44,7 @@ class Context:
 
         events = []
         for ticker in tickers:
-            events.extend(self.data.get_candles(ticker, history_days))  # always: fills/marking
+            events.extend(self.data.get_candles(ticker, history_days, extended_hours))  # always: fills/marking
             if level1 or level2:
                 events.extend(self.data.get_events(ticker, history_days, level1, level2))
         events.sort(key=lambda e: e["time"])
