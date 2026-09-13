@@ -12,11 +12,16 @@ _L2_DDL = "time INTEGER, bids TEXT, asks TEXT"
 
 class Data:
     def __init__(self, cache_db="~/.schwabdev/candles.db", client=None):
+        """`cache_db` is the SQLite file storing the candle cache. Set it to None, "", or ":memory:"
+        to use a transient in-memory SQLite database."""
+        if cache_db in (None, ""):
+            cache_db = ":memory:"
         self.db_path = os.path.expanduser(cache_db)
-        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
+        if self.db_path != ":memory:":
+            os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         self._client = client
         self._con = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._tables = set() 
+        self._tables = set()
 
     @staticmethod
     def table(prefix, ticker):
